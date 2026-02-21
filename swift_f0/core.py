@@ -1,6 +1,6 @@
 import onnxruntime
 import numpy as np
-from typing import Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import os
 
@@ -52,12 +52,25 @@ class SwiftF0:
     DEFAULT_CONFIDENCE_THRESHOLD = 0.9
     DEFAULT_FMIN = MODEL_FMIN  # Minimum frequency for voiced regions
     DEFAULT_FMAX = MODEL_FMAX  # Maximum frequency for voiced regions
+    _ALLOWED_EXECUTION_PROVIDERS = frozenset(("auto", "coreml", "cpu"))
+    _PROVIDER_NAME_BY_ALIAS = {
+        "coreml": "CoreMLExecutionProvider",
+        "cpu": "CPUExecutionProvider",
+    }
+    _PROVIDER_ALIAS_BY_NAME = {
+        provider_name.lower(): alias
+        for alias, provider_name in _PROVIDER_NAME_BY_ALIAS.items()
+    }
 
     def __init__(
         self,
         confidence_threshold: Optional[float] = None,
         fmin: Optional[float] = None,
         fmax: Optional[float] = None,
+        execution_provider: str = "auto",
+        provider_options: Optional[Dict[str, Any]] = None,
+        fallback_to_cpu: bool = True,
+        verbose_provider_logs: bool = False,
     ):
         """
         Initialize SwiftF0 with the bundled ONNX model.
@@ -66,6 +79,18 @@ class SwiftF0:
             confidence_threshold: Confidence threshold (0-1) for voicing decision
             fmin: Minimum frequency (Hz) to consider voiced
             fmax: Maximum frequency (Hz) to consider voiced
+            execution_provider: Runtime provider selection:
+                - "auto": Prefer CoreML (if available), fallback to CPU
+                - "coreml": Request CoreML explicitly
+                - "cpu": Force CPU provider
+            provider_options: Optional ONNX Runtime provider options. Supports:
+                - nested map keyed by provider alias ("coreml", "cpu"), or
+                - nested map keyed by provider name
+                  ("CoreMLExecutionProvider", "CPUExecutionProvider"), or
+                - flat options dict (applied to CoreML provider when used)
+            fallback_to_cpu: If True, append/use CPU provider when CoreML is
+                unavailable. If False, explicit CoreML request raises error.
+            verbose_provider_logs: If True, print provider selection/fallback logs.
 
         Raises:
             ValueError: For invalid parameters:
@@ -74,6 +99,7 @@ class SwiftF0:
                 - fmax > MODEL_FMAX (2093.75 Hz)
                 - fmin > fmax
                 - Frequency range completely outside model capabilities
+                - unsupported execution_provider token
         """
         # Validate and set confidence threshold
         if confidence_threshold is not None:
@@ -113,6 +139,12 @@ class SwiftF0:
                 f"model capabilities [{self.MODEL_FMIN}, {self.MODEL_FMAX}] Hz. "
                 "No voiced frames would be detected."
             )
+        self.execution_provider = self._normalize_execution_provider(execution_provider)
+        self.provider_options = provider_options or {}
+        if not isinstance(self.provider_options, dict):
+            raise ValueError("provider_options must be a dictionary if provided")
+        self.fallback_to_cpu = bool(fallback_to_cpu)
+        self.verbose_provider_logs = bool(verbose_provider_logs)
 
         # Locate and verify the bundled ONNX model
         model_path = os.path.join(os.path.dirname(__file__), "model.onnx")
@@ -123,10 +155,159 @@ class SwiftF0:
         session_options = onnxruntime.SessionOptions()
         session_options.inter_op_num_threads = 1
         session_options.intra_op_num_threads = 1
-        self.pitch_session = onnxruntime.InferenceSession(
-            model_path, session_options, providers=["CPUExecutionProvider"]
+        providers, provider_options_list = self._resolve_provider_chain()
+        try:
+            self.pitch_session = self._create_inference_session(
+                model_path,
+                session_options,
+                providers,
+                provider_options_list,
+            )
+        except Exception as provider_error:
+            can_retry_cpu = (
+                self.fallback_to_cpu
+                and providers != ["CPUExecutionProvider"]
+                and "CPUExecutionProvider" in set(onnxruntime.get_available_providers())
+            )
+            if not can_retry_cpu:
+                raise
+            self._provider_log(
+                "Provider initialization failed ({}). Retrying with CPUExecutionProvider.".format(
+                    provider_error
+                )
+            )
+            self.pitch_session = self._create_inference_session(
+                model_path,
+                session_options,
+                ["CPUExecutionProvider"],
+                [{}],
+            )
+        self.active_execution_providers = self.pitch_session.get_providers()
+        self._provider_log(
+            "Active providers: {}".format(", ".join(self.active_execution_providers))
         )
         self.pitch_input_name = self.pitch_session.get_inputs()[0].name
+
+    def _create_inference_session(
+        self,
+        model_path: str,
+        session_options: onnxruntime.SessionOptions,
+        providers: List[str],
+        provider_options_list: List[Dict[str, Any]],
+    ) -> onnxruntime.InferenceSession:
+        try:
+            return onnxruntime.InferenceSession(
+                model_path,
+                session_options,
+                providers=providers,
+                provider_options=provider_options_list,
+            )
+        except TypeError:
+            # Older ONNX Runtime versions may not support provider_options kwarg.
+            return onnxruntime.InferenceSession(
+                model_path,
+                session_options,
+                providers=providers,
+            )
+
+    def _provider_log(self, message: str) -> None:
+        if self.verbose_provider_logs:
+            print(f"[SWIFTF0] {message}")
+
+    def _normalize_execution_provider(self, execution_provider: str) -> str:
+        provider = str(execution_provider).strip().lower()
+        if provider not in self._ALLOWED_EXECUTION_PROVIDERS:
+            raise ValueError(
+                "execution_provider must be one of {} (got '{}')".format(
+                    sorted(self._ALLOWED_EXECUTION_PROVIDERS),
+                    execution_provider,
+                )
+            )
+        return provider
+
+    def _normalize_provider_options(self) -> Dict[str, Dict[str, Any]]:
+        if not self.provider_options:
+            return {}
+
+        # If values are dicts, treat this as provider-keyed options.
+        if any(isinstance(value, dict) for value in self.provider_options.values()):
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for key, value in self.provider_options.items():
+                if value is None:
+                    continue
+                provider_key = str(key).strip().lower()
+                if provider_key in self._PROVIDER_NAME_BY_ALIAS:
+                    alias = provider_key
+                else:
+                    alias = self._PROVIDER_ALIAS_BY_NAME.get(provider_key)
+                if alias is None:
+                    continue
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        "provider_options for '{}' must be a dictionary".format(key)
+                    )
+                normalized[alias] = value
+            return normalized
+
+        # Flat options dict: apply only to CoreML when selected.
+        return {"coreml": dict(self.provider_options)}
+
+    def _resolve_provider_chain(self) -> Tuple[List[str], List[Dict[str, Any]]]:
+        available = set(onnxruntime.get_available_providers())
+        self._provider_log("Requested execution provider: {}".format(self.execution_provider))
+        self._provider_log("Available providers: {}".format(", ".join(sorted(available))))
+
+        normalized_options = self._normalize_provider_options()
+        resolved_providers: List[str] = []
+        resolved_options: List[Dict[str, Any]] = []
+
+        def _add_provider(alias: str) -> bool:
+            provider_name = self._PROVIDER_NAME_BY_ALIAS[alias]
+            if provider_name not in available:
+                return False
+            resolved_providers.append(provider_name)
+            resolved_options.append(normalized_options.get(alias, {}))
+            return True
+
+        requested = self.execution_provider
+        if requested == "cpu":
+            if not _add_provider("cpu"):
+                raise RuntimeError("CPUExecutionProvider is not available in this ONNX Runtime build.")
+        elif requested == "coreml":
+            has_coreml = _add_provider("coreml")
+            if not has_coreml:
+                if self.fallback_to_cpu and _add_provider("cpu"):
+                    self._provider_log(
+                        "CoreMLExecutionProvider unavailable; falling back to CPUExecutionProvider"
+                    )
+                else:
+                    raise RuntimeError(
+                        "CoreMLExecutionProvider is not available and fallback_to_cpu is disabled."
+                    )
+            elif self.fallback_to_cpu:
+                _add_provider("cpu")
+        else:  # auto
+            has_coreml = _add_provider("coreml")
+            if has_coreml:
+                if self.fallback_to_cpu:
+                    _add_provider("cpu")
+            else:
+                self._provider_log(
+                    "CoreMLExecutionProvider unavailable; using CPUExecutionProvider"
+                )
+                _add_provider("cpu")
+
+        if not resolved_providers:
+            raise RuntimeError(
+                "Failed to resolve an ONNX Runtime execution provider. Available providers: {}".format(
+                    sorted(available)
+                )
+            )
+
+        self._provider_log(
+            "Resolved provider chain: {}".format(", ".join(resolved_providers))
+        )
+        return resolved_providers, resolved_options
 
     def _extract_pitch_and_confidence(
         self, audio_16k: np.ndarray

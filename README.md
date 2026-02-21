@@ -42,6 +42,9 @@ from swift_f0 import *
 # For speech analysis, consider setting fmin=65 and fmax=400
 detector = SwiftF0(fmin=46.875, fmax=2093.75, confidence_threshold=0.9)
 
+# Optional provider control (CoreML on macOS, with CPU fallback)
+# detector = SwiftF0(execution_provider="auto", fallback_to_cpu=True)
+
 # Run pitch detection from an audio file
 result = detector.detect_from_file("audio.wav")
 
@@ -73,9 +76,21 @@ SwiftF0(
     confidence_threshold: Optional[float] = 0.9,
     fmin: Optional[float] = 46.875,
     fmax: Optional[float] = 2093.75,
+    execution_provider: str = "auto",
+    provider_options: Optional[Dict[str, Any]] = None,
+    fallback_to_cpu: bool = True,
+    verbose_provider_logs: bool = False,
 )
 ```
 Initialize the pitch detector. Processes audio at 16kHz with 256-sample hop size. The model always detects pitch across its full range (46.875-2093.75 Hz), but these parameters control which detections are marked as "voiced" in the results.
+
+Provider controls:
+- `execution_provider="auto"`: prefer CoreML when available, otherwise CPU.
+- `execution_provider="coreml"`: request CoreML explicitly.
+- `execution_provider="cpu"`: force CPU inference.
+- `provider_options`: optional ONNX Runtime provider options.
+- `fallback_to_cpu`: if `False`, explicit CoreML request fails instead of falling back.
+- `verbose_provider_logs`: prints provider selection and fallback diagnostics.
 
 #### `SwiftF0.detect_from_array(...)`
 ```python

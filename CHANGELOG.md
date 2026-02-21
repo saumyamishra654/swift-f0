@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- ONNX Runtime execution-provider controls on `SwiftF0`:
+  - `execution_provider="auto|coreml|cpu"`
+  - `provider_options`
+  - `fallback_to_cpu`
+  - `verbose_provider_logs`
+
+### Changed
+- Session creation now resolves providers dynamically (CoreML when available, CPU fallback by default).
+- Backward compatibility is preserved for existing constructor usage (`confidence_threshold`, `fmin`, `fmax`).
+
 ## [0.1.2] - 2025-07-25
 
 ### Added
